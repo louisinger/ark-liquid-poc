@@ -1,7 +1,22 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import axios from 'axios';
-import { BIP174SigningData, Pset, script, Signer } from 'liquidjs-lib';
+import { ECPairInterface } from 'ecpair';
+import {
+  BIP174SigningData,
+  ElementsValue,
+  networks,
+  payments,
+  Pset,
+  script,
+  Signer,
+  Transaction,
+  UpdaterInput,
+  UpdaterOutput,
+} from 'liquidjs-lib';
 import { ECDSAVerifier, SchnorrVerifier } from 'liquidjs-lib/src/psetv2/pset';
+import * as ecc from 'tiny-secp256k1';
+
+import { Wallet } from './core';
 
 const APIURL = process.env.APIURL || 'http://localhost:3001';
 export const TESTNET_APIURL = 'https://blockstream.info/liquidtestnet/api';
@@ -113,4 +128,77 @@ export async function broadcast(
 
 function sleep(ms: number): Promise<any> {
   return new Promise((res: any): any => setTimeout(res, ms));
+}
+
+export class TestWallet implements Wallet {
+  private p2wpkh: payments.Payment;
+  private outpoints: { txid: string; vout: number }[] = [];
+
+  constructor(private keys: ECPairInterface) {
+    this.p2wpkh = payments.p2wpkh({
+      pubkey: this.keys.publicKey,
+      network: networks.regtest,
+    });
+  }
+
+  getPublicKey(): Buffer {
+    return this.keys.publicKey;
+  }
+
+  async coinSelect(
+    amount: number,
+    asset: string
+  ): Promise<{ coins: UpdaterInput[]; change?: UpdaterOutput }> {
+    const { txid, vout } = await faucet(this.p2wpkh.address);
+    this.outpoints.push({ txid, vout });
+    const txHex = await fetchTx(txid);
+    const transaction = Transaction.fromHex(txHex);
+    const witnessUtxo = transaction.outs[vout];
+
+    const utxo: UpdaterInput = {
+      txid,
+      txIndex: vout,
+      witnessUtxo,
+      sighashType: Transaction.SIGHASH_ALL,
+    };
+
+    const utxoAmount = ElementsValue.fromBytes(witnessUtxo.value).number;
+    const changeAmount = utxoAmount - amount;
+
+    if (changeAmount <= 0) {
+      return {
+        coins: [utxo],
+      };
+    }
+
+    const changeOutput: UpdaterOutput = {
+      amount: changeAmount,
+      asset,
+      script: this.p2wpkh.output,
+    };
+
+    return {
+      coins: [utxo],
+      change: changeOutput,
+    };
+  }
+
+  sign(pset: Pset): Pset {
+    const signers = [];
+    for (const input of pset.inputs) {
+      const inputID = Buffer.from(input.previousTxid).reverse().toString('hex');
+
+      if (
+        this.outpoints.find(
+          (o) => o.txid === inputID && o.vout === input.previousTxIndex
+        )
+      ) {
+        signers.push([this.keys]);
+      } else {
+        signers.push([]);
+      }
+    }
+
+    return signTransaction(pset, signers, Transaction.SIGHASH_ALL, ecc);
+  }
 }

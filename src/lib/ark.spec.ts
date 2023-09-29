@@ -1,203 +1,120 @@
 import test from 'ava';
 import { ECPairFactory } from 'ecpair';
-import {
-  address,
-  ElementsValue,
-  Extractor,
-  Finalizer,
-  networks,
-  payments,
-  Pset,
-  Transaction,
-} from 'liquidjs-lib';
+import { Extractor, Finalizer, networks, Pset } from 'liquidjs-lib';
 import * as ecc from 'tiny-secp256k1';
 
-import { broadcast, faucet, fetchTx, signTransaction } from './_regtest.spec';
-import {
-  ASP_FEE,
-  createPoolTransaction,
-  makeForfeitTransaction,
-  makeSendMessage,
-  OnboardOrder,
-  SendOrder,
-  signSendOrderPoolPset,
-  validateSendOrder,
-} from './ark';
+import { broadcast, TestWallet } from './_regtest.spec';
+import { createPoolTransaction, hashForfeitMessage } from './ark';
+import { ForfeitMessage, OnboardOrder, TransferOrder } from './core';
 
 const ECPair = ECPairFactory(ecc);
 
+const ONE_LBTC = 1_0000_0000;
+const LBTC = networks.regtest.assetHash;
+
 const alice = ECPair.makeRandom();
-const aliceP2WPKH = payments.p2wpkh({
-  pubkey: alice.publicKey,
-  network: networks.regtest,
-});
+const aliceWallet = new TestWallet(alice);
 
 const serviceProvider = ECPair.makeRandom();
-const serviceProviderP2WPKH = payments.p2wpkh({
-  pubkey: serviceProvider.publicKey,
-  network: networks.regtest,
-});
+const serviceProviderWallet = new TestWallet(serviceProvider);
 
 const bob = ECPair.makeRandom();
-const bobP2WPKH = payments.p2wpkh({
-  pubkey: bob.publicKey,
-  network: networks.regtest,
-});
 
-let aliceUtxo: Transaction['outs'][0];
-let aliceUtxoOutpoint: { txid: string; vout: number };
-// faucet Alice
-test.before(async (t) => {
-  const { txid, vout } = await faucet(aliceP2WPKH.address);
-  const txHex = await fetchTx(txid);
-  const transaction = Transaction.fromHex(txHex);
-  aliceUtxo = transaction.outs[vout];
-  aliceUtxoOutpoint = { txid, vout };
-  t.pass();
-});
+test('it should let Alice to create vUtxo, and send it to Bob', async (t) => {
+  const { coins, change } = await aliceWallet.coinSelect(ONE_LBTC, LBTC);
+  t.is(change, undefined, 'alice change should be undefined');
 
-test('ark POC', async (t) => {
-  // Alice onboards on ark, it creates an onboard order with her utxo and send it to the ark service provider
-  const onboardOrder: OnboardOrder = {
-    coins: [
-      {
-        txid: aliceUtxoOutpoint.txid,
-        txIndex: aliceUtxoOutpoint.vout,
-        witnessUtxo: aliceUtxo,
-        sighashType: Transaction.SIGHASH_ALL,
-      },
-    ],
-    redeemPublicKey: alice.publicKey,
+  // Alice selects some on-chain coin to onboard on Ark
+  const aliceOnboard: OnboardOrder = {
+    coins,
+    vUtxoPublicKey: alice.publicKey,
   };
 
   // the ASP receives several onboard orders and creates a pool transaction
-  // it also creates the assosiated redeem txs and signs them
-  const { redeems, unsignedPoolPset } = createPoolTransaction(
-    serviceProviderP2WPKH.address,
-    serviceProvider.privateKey,
-    {
-      onboardOrders: [onboardOrder],
-      sendOrders: [],
-    },
-    networks.regtest.genesisBlockHash,
-    networks.regtest.assetHash
+  // it returns associated taproot vUtxo taproot tree to Alice
+  const { vUtxos, unsignedPoolPset } = await createPoolTransaction(
+    serviceProviderWallet,
+    [aliceOnboard],
+    [],
+    networks.regtest
   );
+
+  const vUtxoAlice = vUtxos.get(alice.publicKey.toString('hex'));
+  t.not(vUtxoAlice, undefined, 'createPoolTransaction should return vUtxos');
 
   // the ASP sends the pool transaction and the redeem tx to Alice
-  // Alice checks that redeem is signed by the ASP
-  // Alice checks that pool tx creates a valid virtual utxo
+  // Alice checks that the tree is correct and associated with its publickey
 
   // Alice signs the pool tx and resend it to ASP
-  const signedPoolPset = signTransaction(
-    Pset.fromBase64(unsignedPoolPset),
-    [[alice]],
-    Transaction.SIGHASH_ALL,
-    ecc
+  const signedPoolPsetByAlice = aliceWallet.sign(
+    Pset.fromBase64(unsignedPoolPset)
   );
+  const signedPoolPset = serviceProviderWallet.sign(signedPoolPsetByAlice);
 
   // ASP checks that the pool tx is signed by Alice
   // ASP finalize the pool tx and broadcast it
-
-  const finalizer = new Finalizer(signedPoolPset);
-  finalizer.finalize();
+  new Finalizer(signedPoolPset).finalize();
   const poolTransaction = Extractor.extract(signedPoolPset);
   const txID = await broadcast(poolTransaction.toHex());
-  // Once broadcasted, Alice has 1 virtual L-BTC on Ark
-  const aliceVirtualUtxo = poolTransaction.outs[0];
-  // At any moment, Alice can exit the Ark by signing and broadcasting the redeem tx
-  const aliceRedeemPset = Pset.fromBase64(
-    redeems.get(alice.publicKey.toString('hex'))
-  );
-  console.log(
-    'Alice redeem pset: ',
-    redeems.get(alice.publicKey.toString('hex'))
+  console.log('pool txID 0:', txID);
+  console.log('pool tx 0 (hex):', poolTransaction.toHex());
+  console.log('\n');
+
+  // At any moment, Alice can exit the Ark by creating a redeem transaction
+  // const aliceRedeem = makeRedeemTransaction(vUtxoAlice.vUtxo, vUtxoAlice.vUtxoTree.redeemLeaf)
+
+  // then Alice wants to send the vUtxo to Bob
+  // firstly, she ask for a place in next pool transaction to the ASP
+  const aliceTransferOrder: TransferOrder = {
+    toPublicKey: bob.publicKey,
+    vUtxo: vUtxoAlice.vUtxo,
+  };
+
+  // the ASP gets the transfer order and process it in the next pool tx
+  const nextPoolTx = await createPoolTransaction(
+    serviceProviderWallet,
+    [],
+    [aliceTransferOrder],
+    networks.regtest
   );
 
-  // then Alice wants to send it to Bob
-  // she creates a special message containing the utxo amount + the bob script (TODO include change??)
-  const sendMessage = makeSendMessage(
-    txID,
-    0,
-    address.toOutputScript(bobP2WPKH.address).toString('hex'),
-    ElementsValue.fromBytes(aliceVirtualUtxo.value).number - ASP_FEE
-  );
+  // Alice checks the next Pool tx, if it looks OK, then she creates a *ForfeitMessage* and hash it
+  // the message includes a "promised txID", making the signature valid if and only if the tx exists on chain.
+  const aliceForfeitMessage: ForfeitMessage = {
+    promisedPoolTxID: Pset.fromBase64(nextPoolTx.unsignedPoolPset)
+      .unsignedTx()
+      .getId(),
+    vUtxoIndex: vUtxoAlice.vUtxo.txIndex,
+    vUtxoTxID: vUtxoAlice.vUtxo.txid,
+  };
 
-  console.log('sendMessage (Alice -> Bob)', sendMessage.toString('hex'));
+  const aliceForfeitMessageHash = hashForfeitMessage(aliceForfeitMessage);
 
-  // she signs the message with her private key
+  // she signs the message with the vUtxo private key
   const aliceSignature = ecc.signSchnorr(
-    sendMessage,
+    aliceForfeitMessageHash,
     alice.privateKey,
     Buffer.alloc(32)
   );
+  t.is(aliceSignature.length, 64);
 
-  const sendOrder: Omit<SendOrder, 'forfeitTx'> = {
-    address: bobP2WPKH.address,
-    amount: ElementsValue.fromBytes(aliceVirtualUtxo.value).number - ASP_FEE,
-    coin: {
-      txid: txID,
-      txIndex: 0,
-      witnessUtxo: aliceVirtualUtxo,
-      sighashType: Transaction.SIGHASH_DEFAULT,
-    },
-    signature: Buffer.from(aliceSignature).toString('hex'),
-  };
-
-  // she creates a forfeit tx using the redeem tx she gets during the onboarding
-  const forfeitTx = makeForfeitTransaction(
-    sendOrder,
-    aliceRedeemPset,
-    alice.privateKey,
-    address.toOutputScript(serviceProviderP2WPKH.address),
-    networks.regtest.genesisBlockHash
+  // she sends back the signature to the ASP.
+  // if valid for ASP, it signs the next pool tx. Alice doesn't have to sign anything more.
+  // if everything goes well, Alice won't broadcast a redeem tx and the ASP will get the vUtxo control in 1 month.
+  // if Alice broadcasts a redeem tx (hardcoded scriptPubKey), ASP has the forfeit message and can use it to get the vUtxo.
+  // As soon as Alice as sent the signature, she lost the control on vUtxo IF the next pool tx ID (including bob vUtxo) is broadcasted.
+  const nextPoolTxSigned = serviceProviderWallet.sign(
+    Pset.fromBase64(nextPoolTx.unsignedPoolPset)
   );
 
-  // she sends all to ASP
-  const finalSendOrder = {
-    ...sendOrder,
-    forfeitTx,
-  };
+  new Finalizer(nextPoolTxSigned).finalize();
 
-  // ASP checks that the forfeit tx is valid
-  const [valid, reason] = validateSendOrder(
-    finalSendOrder,
-    aliceRedeemPset,
-    address.toOutputScript(serviceProviderP2WPKH.address).toString('hex'),
-    networks.regtest.genesisBlockHash
-  );
-
-  t.true(valid, reason);
-
-  // Once ASP has validated the sendOrder, bob can consider the utxo is received
-  // even if it is not broadcasted yet, ASP has now an incentive to broadcast it (get the fees)
-
-  // ASP craft the next pool Tx and includes the bob payout
-  const { unsignedPoolPset: nextPoolTx } = createPoolTransaction(
-    serviceProviderP2WPKH.address,
-    serviceProvider.privateKey,
-    {
-      onboardOrders: [],
-      sendOrders: [finalSendOrder],
-    },
-    networks.regtest.genesisBlockHash,
-    networks.regtest.assetHash
-  );
-
-  // this time, ASP has to sign the tx too because it contains send orders
-  const signedNextPoolPset = signSendOrderPoolPset(
-    Pset.fromBase64(nextPoolTx),
-    finalSendOrder,
-    serviceProvider.privateKey,
-    alice.publicKey
-  );
-
-  // ASP broadcast the pool tx
-  const nextPoolTransaction = Extractor.extract(signedNextPoolPset);
+  const nextPoolTransaction = Extractor.extract(nextPoolTxSigned);
 
   const nextTxID = await broadcast(nextPoolTransaction.toHex());
-  console.log('next pool tx:', nextTxID);
+  console.log('pool txID 1:', nextTxID);
+  console.log('pool tx 0 (hex):', nextPoolTransaction.toHex());
 
-  // once the nextTx is confirmed, Bob owns the coin on-chain
-
+  // once the nextTx is in the mempool, Bob owns the vUtxo and can repeat the process.
   t.pass();
 });
