@@ -35,10 +35,8 @@ export const H_POINT: Buffer = Buffer.from(
   'hex'
 );
 
-const CLAIM_TIMEOUT_SECONDS = 60 * 60 * 24 * 30; // 30 days
-const CLAIM_TIMEOUT = bip68(
-  CLAIM_TIMEOUT_SECONDS - (CLAIM_TIMEOUT_SECONDS % 512)
-);
+const CLAIM_TIMEOUT = bip68(60 * 60 * 24 * 30); // 30 days
+const REDEEM_TIMEOUT = bip68(60 * 60 * 24 * 15); // 15 days
 
 // ASP_FEE should be much lower! this value is just to avoid dust outputs
 const CHAIN_FEE = 500;
@@ -53,7 +51,9 @@ export async function createPoolTransaction(
   wallet: Wallet,
   onboards: OnboardOrder[],
   transfers: TransferOrder[],
-  network: networks.Network
+  network: networks.Network,
+  aspClaimTimeout = CLAIM_TIMEOUT,
+  redeemTimeout = REDEEM_TIMEOUT
 ): Promise<UnsignedPoolTransaction> {
   const inputs: UpdaterInput[] = [];
   const outputs: CreatorOutput[] = [];
@@ -79,7 +79,9 @@ export async function createPoolTransaction(
   for (const order of [...onboards, ...onboardOrdersFromTransfer]) {
     const [vUtxoTree, redeemTree] = vUtxoTapTree(
       wallet.getPublicKey(),
-      order.vUtxoPublicKey
+      order.vUtxoPublicKey,
+      aspClaimTimeout,
+      redeemTimeout
     );
 
     const refundKey = Buffer.from(
@@ -235,7 +237,9 @@ function toOnboardOrder(
 
 function vUtxoTapTree(
   serviceProviderPublicKey: Buffer,
-  vUtxoPublicKey: Buffer
+  vUtxoPublicKey: Buffer,
+  aspClaimTimeout: Buffer,
+  redeemTimeout: Buffer
 ): [VirtualUtxoTaprootTree, RedeemTaprootTree] {
   if (serviceProviderPublicKey.length !== 33) {
     throw new Error('serviceProviderPublicKey must be 33 bytes');
@@ -245,20 +249,20 @@ function vUtxoTapTree(
   }
 
   // after CLAIM_TIMEOUT, the ASP should be able to claim the utxo
-  const claim = bscript
-    .compile([
-      CLAIM_TIMEOUT,
-      OPS.OP_CHECKSEQUENCEVERIFY,
-      serviceProviderPublicKey.subarray(1),
-      OPS.OP_CHECKSIG,
-    ])
-    .toString('hex');
+  const claimLeaf = makeTimelockedScriptLeaf(
+    serviceProviderPublicKey.subarray(1),
+    aspClaimTimeout
+  );
 
   const refundKey = Buffer.from(
     ecc.pointAdd(serviceProviderPublicKey, vUtxoPublicKey)
   );
 
-  const redeemTree = redeemTxTapTree(serviceProviderPublicKey, vUtxoPublicKey);
+  const redeemTree = redeemTxTapTree(
+    serviceProviderPublicKey,
+    vUtxoPublicKey,
+    redeemTimeout
+  );
   const outputScript = bip341
     .BIP341Factory(ecc)
     .taprootOutputScript(refundKey, redeemTree.tree);
@@ -301,26 +305,24 @@ function vUtxoTapTree(
     ])
     .toString('hex');
 
-  const leaves: bip341.TaprootLeaf[] = [
-    { scriptHex: claim },
-    { scriptHex: toRedeem },
-  ];
+  const redeemLeaf = { scriptHex: toRedeem };
 
+  const leaves = [redeemLeaf, claimLeaf];
   const tree = bip341.toHashTree(leaves, true);
 
-  const claimLeafHash = bip341.tapLeafHash(leaves[0]);
-  const redeemLeafHash = bip341.tapLeafHash(leaves[1]);
+  const claimLeafHash = bip341.tapLeafHash(claimLeaf);
+  const redeemLeafHash = bip341.tapLeafHash(redeemLeaf);
 
   const redeemPath = bip341.findScriptPath(tree, redeemLeafHash);
   const claimPath = bip341.findScriptPath(tree, claimLeafHash);
 
   const [redeemScript, controlBlock] = bip341
     .BIP341Factory(ecc)
-    .taprootSignScriptStack(refundKey, leaves[0], tree.hash, redeemPath);
+    .taprootSignScriptStack(refundKey, redeemLeaf, tree.hash, redeemPath);
 
   const [claimScript, claimControlBlock] = bip341
     .BIP341Factory(ecc)
-    .taprootSignScriptStack(refundKey, leaves[1], tree.hash, claimPath);
+    .taprootSignScriptStack(refundKey, claimLeaf, tree.hash, claimPath);
 
   return [
     {
@@ -342,7 +344,8 @@ function vUtxoTapTree(
 
 function redeemTxTapTree(
   serviceProviderPubKey: Buffer,
-  vUtxoPublicKey: Buffer
+  vUtxoPublicKey: Buffer,
+  redeemTimeout: Buffer
 ): RedeemTaprootTree {
   const forfeit = bscript
     .compile([
@@ -363,7 +366,7 @@ function redeemTxTapTree(
       // [aspSignature, promisedTxId, hash, hash, signature]
       OPS.OP_SWAP,
       // [aspSignature, promisedTxId, hash, signature, hash]
-      vUtxoPublicKey,
+      vUtxoPublicKey.subarray(1),
       OPS.OP_CHECKSIGFROMSTACKVERIFY,
       // [aspSignature, promisedTxId, hash]
       OPS.OP_2,
@@ -371,7 +374,7 @@ function redeemTxTapTree(
       // [promisedTx, hash, aspSignature]
       OPS.OP_SWAP,
       // [promisedTx, aspSignature, hash]
-      serviceProviderPubKey,
+      serviceProviderPubKey.subarray(1),
       OPS.OP_CHECKSIGFROMSTACKVERIFY,
 
       // [promisedTxId]
@@ -383,7 +386,10 @@ function redeemTxTapTree(
     ])
     .toString('hex');
 
-  const claim = makeTimelockedScriptLeaf(vUtxoPublicKey, CLAIM_TIMEOUT);
+  const claim = makeTimelockedScriptLeaf(
+    vUtxoPublicKey.subarray(1),
+    redeemTimeout
+  );
 
   const leaves = [{ scriptHex: forfeit }, claim];
 

@@ -1,10 +1,25 @@
 import test from 'ava';
+import bip68 from 'bip68';
 import { ECPairFactory } from 'ecpair';
-import { Extractor, Finalizer, networks, Pset } from 'liquidjs-lib';
+import {
+  Creator,
+  CreatorOutput,
+  ElementsValue,
+  Extractor,
+  Finalizer,
+  networks,
+  Pset,
+  Transaction,
+  Updater,
+} from 'liquidjs-lib';
 import * as ecc from 'tiny-secp256k1';
 
 import { broadcast, TestWallet } from './_regtest.spec';
-import { createPoolTransaction, hashForfeitMessage } from './ark';
+import {
+  createPoolTransaction,
+  hashForfeitMessage,
+  makeRedeemTransaction,
+} from './ark';
 import { ForfeitMessage, OnboardOrder, TransferOrder } from './core';
 
 const ECPair = ECPairFactory(ecc);
@@ -116,5 +131,100 @@ test('it should let Alice to create vUtxo, and send it to Bob', async (t) => {
   console.log('pool tx 0 (hex):', nextPoolTransaction.toHex());
 
   // once the nextTx is in the mempool, Bob owns the vUtxo and can repeat the process.
+  t.pass();
+});
+
+test.only('it should let Alice to create vUtxo, but redeem it with a redeem tx', async (t) => {
+  const { coins, change } = await aliceWallet.coinSelect(ONE_LBTC, LBTC);
+  t.is(change, undefined, 'alice change should be undefined');
+
+  const aliceOnboard: OnboardOrder = {
+    coins,
+    vUtxoPublicKey: alice.publicKey,
+  };
+
+  const { vUtxos, unsignedPoolPset } = await createPoolTransaction(
+    serviceProviderWallet,
+    [aliceOnboard],
+    [],
+    networks.regtest,
+    undefined,
+    bip68.encode({ blocks: 1 })
+  );
+
+  const vUtxoAlice = vUtxos.get(alice.publicKey.toString('hex'));
+  t.not(vUtxoAlice, undefined, 'createPoolTransaction should return vUtxos');
+  const signedPoolPsetByAlice = aliceWallet.sign(
+    Pset.fromBase64(unsignedPoolPset)
+  );
+  const signedPoolPset = serviceProviderWallet.sign(signedPoolPsetByAlice);
+
+  new Finalizer(signedPoolPset).finalize();
+  const poolTransaction = Extractor.extract(signedPoolPset);
+  await broadcast(poolTransaction.toHex());
+
+  // At any moment, Alice can exit the Ark by creating a redeem transaction using the redeemLeaf she owns
+  // The transaction will move the vUtxo coins to the redeem taproot tree, letting either Alice to claim it after x time or the ASP to claim it with the signed forfeit message
+  const aliceRedeem = makeRedeemTransaction(
+    vUtxoAlice.vUtxo,
+    vUtxoAlice.vUtxoTree.redeemLeaf
+  );
+
+  const selectionForFees = await aliceWallet.coinSelect(500, LBTC);
+  const updater = new Updater(aliceRedeem);
+  updater.addInputs(selectionForFees.coins);
+  updater.addOutputs([
+    selectionForFees.change,
+    {
+      asset: LBTC,
+      amount: 500,
+    },
+  ]);
+
+  aliceWallet.addOutpointToSignWithKey(
+    vUtxoAlice.vUtxo.txid,
+    vUtxoAlice.vUtxo.txIndex
+  );
+  const signedRedeem = aliceWallet.sign(updater.pset);
+
+  new Finalizer(signedRedeem).finalize();
+  const redeemTransaction = Extractor.extract(signedRedeem);
+  console.log('redeem tx (hex):', redeemTransaction.toHex());
+  const redeemTxID = await broadcast(redeemTransaction.toHex());
+  console.log('redeem txID:', redeemTxID);
+
+  // after timeout (here 1 block), Alice can unlock the redeem tx output #0 (using vUtxo private key)
+  await aliceWallet.coinSelect(500, LBTC); // will generate a block, for testing purpose only
+
+  const moveRedeemUtxoPset = Creator.newPset({
+    outputs: [
+      new CreatorOutput(
+        LBTC,
+        ElementsValue.fromBytes(vUtxoAlice.vUtxo.witnessUtxo.value).number -
+          500,
+        aliceWallet.getAddressOutputScript()
+      ),
+      new CreatorOutput(LBTC, 500),
+    ],
+  });
+
+  new Updater(moveRedeemUtxoPset).addInputs([
+    {
+      txid: redeemTransaction.getId(),
+      txIndex: 0,
+      witnessUtxo: redeemTransaction.outs[0],
+      sighashType: Transaction.SIGHASH_DEFAULT,
+      tapInternalKey: vUtxoAlice.vUtxo.tapInternalKey,
+      tapLeafScript: vUtxoAlice.redeemTree.claimLeaf,
+    },
+  ]);
+
+  aliceWallet.addOutpointToSignWithKey(redeemTransaction.getId(), 0);
+  const signedMoveRedeemUtxoPset = aliceWallet.sign(moveRedeemUtxoPset);
+  new Finalizer(signedMoveRedeemUtxoPset).finalize();
+  const moveRedeemUtxoTx = Extractor.extract(signedMoveRedeemUtxoPset);
+  console.log('move redeem tx (hex):', moveRedeemUtxoTx.toHex());
+  const moveRedeemUtxoTxID = await broadcast(moveRedeemUtxoTx.toHex());
+  console.log('move redeem txID:', moveRedeemUtxoTxID);
   t.pass();
 });

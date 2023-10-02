@@ -5,6 +5,7 @@ const SECONDS_MOD = 1 << SEQUENCE_LOCKTIME_GRANULARITY;
 const SECONDS_MAX = SEQUENCE_LOCKTIME_MASK << SEQUENCE_LOCKTIME_GRANULARITY;
 
 export function bip68(seconds: number): Buffer {
+  seconds = closerToModulo512(seconds);
   if (!Number.isFinite(seconds)) throw new Error('Invalid seconds');
   if (seconds > SECONDS_MAX)
     throw new Error('seconds too large, max is ' + SECONDS_MAX);
@@ -14,4 +15,8 @@ export function bip68(seconds: number): Buffer {
   const asNumber =
     SEQUENCE_LOCKTIME_TYPE_FLAG | (seconds >> SEQUENCE_LOCKTIME_GRANULARITY);
   return Buffer.from(asNumber.toString(16), 'hex').reverse();
+}
+
+function closerToModulo512(x: number): number {
+  return x - (x % 512);
 }

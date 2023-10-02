@@ -3,6 +3,8 @@ import axios from 'axios';
 import { ECPairInterface } from 'ecpair';
 import {
   BIP174SigningData,
+  bip341,
+  BIP371SigningData,
   ElementsValue,
   networks,
   payments,
@@ -13,7 +15,6 @@ import {
   UpdaterInput,
   UpdaterOutput,
 } from 'liquidjs-lib';
-import { ECDSAVerifier, SchnorrVerifier } from 'liquidjs-lib/src/psetv2/pset';
 import * as ecc from 'tiny-secp256k1';
 
 import { Wallet } from './core';
@@ -87,22 +88,60 @@ export async function fetchTx(txId: string): Promise<string> {
 
 export function signTransaction(
   pset: Pset,
-  signers: any[],
-  sighashType: number,
-  ecclib: ECDSAVerifier & SchnorrVerifier
+  signers: ECPairInterface[][]
 ): Pset {
   const signer = new Signer(pset);
 
   signers.forEach((keyPairs, i) => {
-    const preimage = pset.getInputPreimage(i, sighashType);
-    keyPairs.forEach((kp: any) => {
+    const input = pset.inputs[i];
+    const isTaproot = input.tapLeafScript && input.tapLeafScript.length > 0;
+    if (isTaproot && input.tapLeafScript.length > 1)
+      throw new Error('Must be 1 tapLeafScript');
+    const leaf = isTaproot
+      ? bip341.tapLeafHash({
+          scriptHex: input.tapLeafScript.at(0).script.toString('hex'),
+        })
+      : undefined;
+    const genesisBlockHash = isTaproot
+      ? networks.regtest.genesisBlockHash
+      : undefined;
+
+    const preimage = pset.getInputPreimage(
+      i,
+      isTaproot
+        ? Transaction.SIGHASH_DEFAULT
+        : input.sighashType ?? Transaction.SIGHASH_ALL,
+      genesisBlockHash,
+      leaf
+    );
+    keyPairs.forEach((kp) => {
+      if (isTaproot) {
+        const partialSig: BIP371SigningData = {
+          tapScriptSigs: [
+            {
+              leafHash: leaf,
+              pubkey: kp.publicKey.subarray(1),
+              signature: Buffer.from(
+                ecc.signSchnorr(preimage, kp.privateKey, Buffer.alloc(32))
+              ),
+            },
+          ],
+          genesisBlockHash,
+        };
+        signer.addSignature(i, partialSig, Pset.SchnorrSigValidator(ecc));
+        return;
+      }
+
       const partialSig: BIP174SigningData = {
         partialSig: {
           pubkey: kp.publicKey,
-          signature: script.signature.encode(kp.sign(preimage), sighashType),
+          signature: script.signature.encode(
+            kp.sign(preimage),
+            input.sighashType ?? Transaction.SIGHASH_ALL
+          ),
         },
       };
-      signer.addSignature(i, partialSig, Pset.ECDSASigValidator(ecclib));
+      signer.addSignature(i, partialSig, Pset.ECDSASigValidator(ecc));
     });
   });
 
@@ -199,6 +238,17 @@ export class TestWallet implements Wallet {
       }
     }
 
-    return signTransaction(pset, signers, Transaction.SIGHASH_ALL, ecc);
+    return signTransaction(pset, signers);
+  }
+
+  // below methods are test helpers
+
+  getAddressOutputScript(): Buffer {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    return this.p2wpkh.output!;
+  }
+
+  addOutpointToSignWithKey(txid: string, vout: number): void {
+    this.outpoints.push({ txid, vout });
   }
 }

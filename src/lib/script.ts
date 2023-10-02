@@ -5,6 +5,7 @@ export function makeTimelockedScriptLeaf(pubKey: Buffer, timeoutBIP68: Buffer) {
   const timelockedScript = script.compile([
     timeoutBIP68,
     OPS.OP_CHECKSEQUENCEVERIFY,
+    OPS.OP_DROP,
     pubKey,
     OPS.OP_CHECKSIG,
   ]);
