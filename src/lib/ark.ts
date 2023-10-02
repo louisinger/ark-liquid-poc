@@ -6,12 +6,14 @@ import {
   CreatorOutput,
   crypto,
   ElementsValue,
+  FinalizeFunc,
   networks,
   Pset,
   Transaction,
   Updater,
   UpdaterInput,
   UpdaterOutput,
+  witnessStackToScriptWitness,
 } from 'liquidjs-lib';
 import { BufferWriter } from 'liquidjs-lib/src/bufferutils';
 import { OPS } from 'liquidjs-lib/src/ops';
@@ -130,10 +132,15 @@ export async function createPoolTransaction(
 
   const updater = new Updater(pset);
   updater.addInputs([...inputs, ...feesCoinSelection.coins]);
-  updater.addOutputs(
-    feesCoinSelection.change
-      ? [feesCoinSelection.change, ...connectorsOutputs]
-      : connectorsOutputs
+  const nbOuts = updater.pset.outputs.length;
+  const changeOutputs = feesCoinSelection.change
+    ? connectorsOutputs.concat(feesCoinSelection.change)
+    : connectorsOutputs;
+  updater.addOutputs(changeOutputs);
+
+  const connectorsIndexes = Array.from(
+    { length: changeOutputs.length },
+    (_, i) => nbOuts + i
   );
 
   const unsignedTransaction = updater.pset.unsignedTx();
@@ -161,6 +168,7 @@ export async function createPoolTransaction(
   return {
     unsignedPoolPset: updater.pset.toBase64(),
     vUtxos,
+    connectors: connectorsIndexes,
   };
 }
 
@@ -215,6 +223,37 @@ export function hashForfeitMessage(msg: ForfeitMessage) {
   writer.writeUInt32(msg.vUtxoIndex);
   writer.writeSlice(Buffer.from(msg.promisedPoolTxID, 'hex').reverse());
   return crypto.sha256(writer.buffer);
+}
+
+export function forfeitFinalizer(
+  aspSig: Buffer,
+  userSig: Buffer,
+  msg: ForfeitMessage
+): FinalizeFunc {
+  return function (inIndex: number, pset: Pset) {
+    const tapLeaf = pset.inputs[inIndex].tapLeafScript?.at(0);
+    if (!tapLeaf) {
+      throw new Error('input must have tapLeafScript');
+    }
+
+    const outpoint = BufferWriter.withCapacity(32 + 4);
+    outpoint.writeSlice(Buffer.from(msg.vUtxoTxID, 'hex').reverse());
+    outpoint.writeUInt32(msg.vUtxoIndex);
+
+    const args = [
+      // [aspSignature, signature, outpoint, promisedTxId]
+      aspSig,
+      userSig,
+      outpoint.buffer,
+      Buffer.from(msg.promisedPoolTxID, 'hex').reverse(),
+    ];
+
+    return {
+      finalScriptWitness: witnessStackToScriptWitness(
+        args.concat(tapLeaf.script).concat(tapLeaf.controlBlock)
+      ),
+    };
+  };
 }
 
 function toOnboardOrder(
@@ -355,7 +394,8 @@ function redeemTxTapTree(
       OPS.OP_2,
       OPS.OP_ROLL,
       // [aspSignature, signature, promisedTxId, promisedTxId, outpoint]
-      OPS.CAT,
+      OPS.OP_SWAP,
+      OPS.OP_CAT,
       // [aspSignature, signature, promisedTxId, outpoint+promisedTxId]
       OPS.OP_SHA256,
       // [aspSignature, signature, promisedTxId, hash]
@@ -391,12 +431,14 @@ function redeemTxTapTree(
     redeemTimeout
   );
 
-  const leaves = [{ scriptHex: forfeit }, claim];
+  const forfeitLeaf = { scriptHex: forfeit };
+
+  const leaves = [forfeitLeaf, claim];
 
   const tree = bip341.toHashTree(leaves, true);
 
-  const forfeitLeafHash = bip341.tapLeafHash(leaves[0]);
-  const claimLeafHash = bip341.tapLeafHash(leaves[1]);
+  const forfeitLeafHash = bip341.tapLeafHash(forfeitLeaf);
+  const claimLeafHash = bip341.tapLeafHash(claim);
 
   const forfeitPath = bip341.findScriptPath(tree, forfeitLeafHash);
   const claimPath = bip341.findScriptPath(tree, claimLeafHash);
@@ -407,11 +449,11 @@ function redeemTxTapTree(
 
   const [forfeitScript, forfeitControlBlock] = bip341
     .BIP341Factory(ecc)
-    .taprootSignScriptStack(refundKey, leaves[0], tree.hash, forfeitPath);
+    .taprootSignScriptStack(refundKey, forfeitLeaf, tree.hash, forfeitPath);
 
   const [claimScript, claimControlBlock] = bip341
     .BIP341Factory(ecc)
-    .taprootSignScriptStack(refundKey, leaves[1], tree.hash, claimPath);
+    .taprootSignScriptStack(refundKey, claim, tree.hash, claimPath);
 
   return {
     tree,

@@ -61,4 +61,5 @@ export type UnsignedPoolTransaction = {
       redeemTree: RedeemTaprootTree;
     }
   >;
+  connectors: Array<number>;
 };
