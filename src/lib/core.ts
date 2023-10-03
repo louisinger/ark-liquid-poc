@@ -8,7 +8,6 @@ import {
 } from 'liquidjs-lib';
 
 export type VirtualUtxoTaprootTree = {
-  tree: bip341.HashTree;
   redeemLeaf: TapLeafScript;
   claimLeaf: TapLeafScript; // claim by ASP after CLAIM_TIMEOUT
 };
@@ -53,10 +52,10 @@ export interface Wallet {
 
 export type UnsignedPoolTransaction = {
   unsignedPoolPset: string; // the pool pset without the signatures
-  vUtxos: Map<
+  vUtxo: VirtualUtxo;
+  leaves: Map<
     string,
     {
-      vUtxo: VirtualUtxo;
       vUtxoTree: VirtualUtxoTaprootTree;
       redeemTree: RedeemTaprootTree;
     }

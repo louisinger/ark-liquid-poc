@@ -9,6 +9,7 @@ import {
   FinalizeFunc,
   networks,
   Pset,
+  TapLeafScript,
   Transaction,
   Updater,
   UpdaterInput,
@@ -17,6 +18,11 @@ import {
 } from 'liquidjs-lib';
 import { BufferWriter } from 'liquidjs-lib/src/bufferutils';
 import { OPS } from 'liquidjs-lib/src/ops';
+import {
+  findLeafIncludingScript,
+  sharedCoinTree,
+  Stakeholder,
+} from 'shared-utxo-covenant';
 import * as ecc from 'tiny-secp256k1';
 
 import { bip68 } from './bip68';
@@ -36,6 +42,12 @@ export const H_POINT: Buffer = Buffer.from(
   '0250929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0',
   'hex'
 );
+
+type vUtxoLeaves = {
+  redeemTree: RedeemTaprootTree;
+  redeemLeaf: bip341.TaprootLeaf;
+  claimLeaf: bip341.TaprootLeaf;
+};
 
 const CLAIM_TIMEOUT = bip68(60 * 60 * 24 * 30); // 30 days
 const REDEEM_TIMEOUT = bip68(60 * 60 * 24 * 15); // 15 days
@@ -58,14 +70,13 @@ export async function createPoolTransaction(
   redeemTimeout = REDEEM_TIMEOUT
 ): Promise<UnsignedPoolTransaction> {
   const inputs: UpdaterInput[] = [];
+  const stakeHolders: Stakeholder[] = [];
   const outputs: CreatorOutput[] = [];
 
   const vUtxoTask: {
     vUtxoKey: Buffer;
-    refundKey: Buffer;
-    vUtxoTree: VirtualUtxoTaprootTree;
+    vUtxoLeaves: vUtxoLeaves;
     redeemTree: RedeemTaprootTree;
-    vout: number;
   }[] = [];
 
   const toOnboard = toOnboardOrder(wallet);
@@ -79,45 +90,38 @@ export async function createPoolTransaction(
     .filter((c) => c);
 
   for (const order of [...onboards, ...onboardOrdersFromTransfer]) {
-    const [vUtxoTree, redeemTree] = vUtxoTapTree(
+    const vUtxoLeaves = vUtxoTaprootLeaves(
       wallet.getPublicKey(),
       order.vUtxoPublicKey,
       aspClaimTimeout,
       redeemTimeout
     );
 
-    const refundKey = Buffer.from(
-      ecc.pointAdd(wallet.getPublicKey(), order.vUtxoPublicKey)
-    );
-
-    const covenantScriptPubKey = bip341
-      .BIP341Factory(ecc)
-      .taprootOutputScript(refundKey, vUtxoTree.tree);
-
-    const asset = AssetHash.fromBytes(order.coins[0].witnessUtxo.asset);
-    if (asset.isConfidential) {
-      throw new Error('asset must not be confidential');
-    }
+    stakeHolders.push({
+      amount: sumInputValues(order.coins),
+      leaves: [vUtxoLeaves.claimLeaf, vUtxoLeaves.redeemLeaf],
+    });
 
     inputs.push(...order.coins);
 
-    const vout =
-      outputs.push(
-        new CreatorOutput(
-          asset.hex,
-          sumInputValues(order.coins),
-          covenantScriptPubKey
-        )
-      ) - 1;
-
     vUtxoTask.push({
+      redeemTree: vUtxoLeaves.redeemTree,
       vUtxoKey: order.vUtxoPublicKey,
-      refundKey: refundKey.subarray(1),
-      vUtxoTree,
-      redeemTree,
-      vout,
+      vUtxoLeaves,
     });
   }
+
+  // create the shared output with all stakeholders
+  const taprootTree = sharedCoinTree(stakeHolders);
+  const sharedOutputScript = bip341
+    .BIP341Factory(ecc)
+    .taprootOutputScript(H_POINT, taprootTree);
+
+  const totalAmount = stakeHolders.reduce((acc, s) => acc + s.amount, 0);
+
+  outputs.push(
+    new CreatorOutput(network.assetHash, totalAmount, sharedOutputScript)
+  );
 
   // add the miner fee
   outputs.push(new CreatorOutput(network.assetHash, CHAIN_FEE));
@@ -147,28 +151,28 @@ export async function createPoolTransaction(
   const txID = unsignedTransaction.getId();
 
   // craft the redeem txs
-  const vUtxos: UnsignedPoolTransaction['vUtxos'] = new Map();
+  const leaves: UnsignedPoolTransaction['leaves'] = new Map();
+
+  const vUtxo = {
+    txid: txID,
+    txIndex: 0,
+    tapInternalKey: H_POINT.subarray(1),
+    witnessUtxo: unsignedTransaction.outs[0],
+    sighashType: Transaction.SIGHASH_DEFAULT,
+  };
 
   for (const task of vUtxoTask) {
-    const vUtxo = {
-      txid: txID,
-      txIndex: task.vout,
-      tapInternalKey: task.refundKey,
-      witnessUtxo: unsignedTransaction.outs[task.vout],
-      sighashType: Transaction.SIGHASH_DEFAULT,
-    };
-
-    vUtxos.set(task.vUtxoKey.toString('hex'), {
-      vUtxo,
-      vUtxoTree: task.vUtxoTree,
+    leaves.set(task.vUtxoKey.toString('hex'), {
+      vUtxoTree: vUtxoTree(taprootTree, task.vUtxoLeaves),
       redeemTree: task.redeemTree,
     });
   }
 
   return {
     unsignedPoolPset: updater.pset.toBase64(),
-    vUtxos,
+    leaves,
     connectors: connectorsIndexes,
+    vUtxo,
   };
 }
 
@@ -274,12 +278,43 @@ function toOnboardOrder(
   };
 }
 
-function vUtxoTapTree(
+function toTapLeafScript(
+  leaf: bip341.TaprootLeaf,
+  tree: bip341.HashTree
+): TapLeafScript {
+  const leafInTree = findLeafIncludingScript(tree, leaf.scriptHex);
+  if (!leafInTree) {
+    throw new Error('leaf not found in tree');
+  }
+
+  const path = bip341.findScriptPath(tree, bip341.tapLeafHash(leafInTree));
+  const [script, controlBlock] = bip341
+    .BIP341Factory(ecc)
+    .taprootSignScriptStack(H_POINT, leafInTree, tree.hash, path);
+
+  return {
+    script,
+    controlBlock,
+    leafVersion: bip341.LEAF_VERSION_TAPSCRIPT,
+  };
+}
+
+function vUtxoTree(
+  vUtxoTree: bip341.HashTree,
+  leaves: vUtxoLeaves
+): VirtualUtxoTaprootTree {
+  return {
+    claimLeaf: toTapLeafScript(leaves.claimLeaf, vUtxoTree),
+    redeemLeaf: toTapLeafScript(leaves.redeemLeaf, vUtxoTree),
+  };
+}
+
+function vUtxoTaprootLeaves(
   serviceProviderPublicKey: Buffer,
   vUtxoPublicKey: Buffer,
   aspClaimTimeout: Buffer,
   redeemTimeout: Buffer
-): [VirtualUtxoTaprootTree, RedeemTaprootTree] {
+): vUtxoLeaves {
   if (serviceProviderPublicKey.length !== 33) {
     throw new Error('serviceProviderPublicKey must be 33 bytes');
   }
@@ -346,39 +381,11 @@ function vUtxoTapTree(
 
   const redeemLeaf = { scriptHex: toRedeem };
 
-  const leaves = [redeemLeaf, claimLeaf];
-  const tree = bip341.toHashTree(leaves, true);
-
-  const claimLeafHash = bip341.tapLeafHash(claimLeaf);
-  const redeemLeafHash = bip341.tapLeafHash(redeemLeaf);
-
-  const redeemPath = bip341.findScriptPath(tree, redeemLeafHash);
-  const claimPath = bip341.findScriptPath(tree, claimLeafHash);
-
-  const [redeemScript, controlBlock] = bip341
-    .BIP341Factory(ecc)
-    .taprootSignScriptStack(refundKey, redeemLeaf, tree.hash, redeemPath);
-
-  const [claimScript, claimControlBlock] = bip341
-    .BIP341Factory(ecc)
-    .taprootSignScriptStack(refundKey, claimLeaf, tree.hash, claimPath);
-
-  return [
-    {
-      redeemLeaf: {
-        controlBlock,
-        leafVersion: bip341.LEAF_VERSION_TAPSCRIPT,
-        script: redeemScript,
-      },
-      claimLeaf: {
-        controlBlock: claimControlBlock,
-        leafVersion: bip341.LEAF_VERSION_TAPSCRIPT,
-        script: claimScript,
-      },
-      tree,
-    },
+  return {
+    claimLeaf,
+    redeemLeaf,
     redeemTree,
-  ];
+  };
 }
 
 function redeemTxTapTree(

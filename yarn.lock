@@ -5040,6 +5040,15 @@ sha.js@^2.4.0, sha.js@^2.4.8:
     inherits "^2.0.1"
     safe-buffer "^5.0.1"
 
+shared-utxo-covenant@^1.0.0:
+  version "1.0.0"
+  resolved "https://registry.yarnpkg.com/shared-utxo-covenant/-/shared-utxo-covenant-1.0.0.tgz#710abe963dd54de1af3b40d7e736e6cca883f29c"
+  integrity sha512-FpnXyINXicem/Lt5I1bMzsHIzqHFzBM5ngw36qkyhhDz2b2qP/HX93ywHem4NNXEiG8pJQmZH2KQbhX9u9NdNw==
+  dependencies:
+    "@bitauth/libauth" "^1.17.1"
+    liquidjs-lib "^6.0.2-liquid.30"
+    tiny-secp256k1 "^2.2.3"
+
 shebang-command@^1.2.0:
   version "1.2.0"
   resolved "https://registry.yarnpkg.com/shebang-command/-/shebang-command-1.2.0.tgz#44aac65b695b03398968c39f363fee5deafdf1ea"

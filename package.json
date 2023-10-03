@@ -44,6 +44,7 @@
     "@bitauth/libauth": "^1.17.1",
     "@vulpemventures/secp256k1-zkp": "^3.1.0",
     "liquidjs-lib": "^6.0.2-liquid.30",
+    "shared-utxo-covenant": "^1.0.0",
     "tiny-secp256k1": "^2.2.3"
   },
   "devDependencies": {

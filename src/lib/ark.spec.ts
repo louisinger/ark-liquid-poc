@@ -48,15 +48,19 @@ test('vUtxo can be sent as quick as the ASP creates a pool transaction', async (
 
   // the ASP receives several onboard orders and creates a pool transaction
   // it returns associated taproot vUtxo taproot tree to Alice
-  const { vUtxos, unsignedPoolPset } = await createPoolTransaction(
+  const { vUtxo, leaves, unsignedPoolPset } = await createPoolTransaction(
     serviceProviderWallet,
     [aliceOnboard],
     [],
     networks.regtest
   );
 
-  const vUtxoAlice = vUtxos.get(alice.publicKey.toString('hex'));
-  t.not(vUtxoAlice, undefined, 'createPoolTransaction should return vUtxos');
+  const vUtxoLeavesAlice = leaves.get(alice.publicKey.toString('hex'));
+  t.not(
+    vUtxoLeavesAlice,
+    undefined,
+    'createPoolTransaction should return vUtxos'
+  );
 
   // the ASP sends the pool transaction and the redeem tx to Alice
   // Alice checks that the tree is correct and associated with its publickey
@@ -74,7 +78,6 @@ test('vUtxo can be sent as quick as the ASP creates a pool transaction', async (
   const txID = await broadcast(poolTransaction.toHex());
   console.log('pool txID 0:', txID);
   console.log('pool tx 0 (hex):', poolTransaction.toHex());
-  console.log('\n');
 
   // At any moment, Alice can exit the Ark by creating a redeem transaction
   // const aliceRedeem = makeRedeemTransaction(vUtxoAlice.vUtxo, vUtxoAlice.vUtxoTree.redeemLeaf)
@@ -83,7 +86,7 @@ test('vUtxo can be sent as quick as the ASP creates a pool transaction', async (
   // firstly, she ask for a place in next pool transaction to the ASP
   const aliceTransferOrder: TransferOrder = {
     toPublicKey: bob.publicKey,
-    vUtxo: vUtxoAlice.vUtxo,
+    vUtxo,
   };
 
   // the ASP gets the transfer order and process it in the next pool tx
@@ -100,8 +103,8 @@ test('vUtxo can be sent as quick as the ASP creates a pool transaction', async (
     promisedPoolTxID: Pset.fromBase64(nextPoolTx.unsignedPoolPset)
       .unsignedTx()
       .getId(),
-    vUtxoIndex: vUtxoAlice.vUtxo.txIndex,
-    vUtxoTxID: vUtxoAlice.vUtxo.txid,
+    vUtxoIndex: vUtxo.txIndex,
+    vUtxoTxID: vUtxo.txid,
   };
 
   const aliceForfeitMessageHash = hashForfeitMessage(aliceForfeitMessage);
@@ -144,7 +147,7 @@ test('vUtxo can leave the Ark using a redeem transaction', async (t) => {
     vUtxoPublicKey: alice.publicKey,
   };
 
-  const { vUtxos, unsignedPoolPset } = await createPoolTransaction(
+  const { vUtxo, leaves, unsignedPoolPset } = await createPoolTransaction(
     serviceProviderWallet,
     [aliceOnboard],
     [],
@@ -153,7 +156,7 @@ test('vUtxo can leave the Ark using a redeem transaction', async (t) => {
     bip68.encode({ blocks: 1 })
   );
 
-  const vUtxoAlice = vUtxos.get(alice.publicKey.toString('hex'));
+  const vUtxoAlice = leaves.get(alice.publicKey.toString('hex'));
   t.not(vUtxoAlice, undefined, 'createPoolTransaction should return vUtxos');
   const signedPoolPsetByAlice = aliceWallet.sign(
     Pset.fromBase64(unsignedPoolPset)
@@ -167,7 +170,7 @@ test('vUtxo can leave the Ark using a redeem transaction', async (t) => {
   // At any moment, Alice can exit the Ark by creating a redeem transaction using the redeemLeaf she owns
   // The transaction will move the vUtxo coins to the redeem taproot tree, letting either Alice to claim it after x time or the ASP to claim it with the signed forfeit message
   const aliceRedeem = makeRedeemTransaction(
-    vUtxoAlice.vUtxo,
+    vUtxo,
     vUtxoAlice.vUtxoTree.redeemLeaf
   );
 
@@ -182,10 +185,7 @@ test('vUtxo can leave the Ark using a redeem transaction', async (t) => {
     },
   ]);
 
-  aliceWallet.addOutpointToSignWithKey(
-    vUtxoAlice.vUtxo.txid,
-    vUtxoAlice.vUtxo.txIndex
-  );
+  aliceWallet.addOutpointToSignWithKey(vUtxo.txid, vUtxo.txIndex);
   const signedRedeem = aliceWallet.sign(updater.pset);
 
   new Finalizer(signedRedeem).finalize();
@@ -201,8 +201,7 @@ test('vUtxo can leave the Ark using a redeem transaction', async (t) => {
     outputs: [
       new CreatorOutput(
         LBTC,
-        ElementsValue.fromBytes(vUtxoAlice.vUtxo.witnessUtxo.value).number -
-          500,
+        1_0000_0000 - 500,
         aliceWallet.getAddressOutputScript()
       ),
       new CreatorOutput(LBTC, 500),
@@ -215,7 +214,7 @@ test('vUtxo can leave the Ark using a redeem transaction', async (t) => {
       txIndex: 0,
       witnessUtxo: redeemTransaction.outs[0],
       sighashType: Transaction.SIGHASH_DEFAULT,
-      tapInternalKey: vUtxoAlice.vUtxo.tapInternalKey,
+      tapInternalKey: vUtxo.tapInternalKey,
       tapLeafScript: vUtxoAlice.redeemTree.claimLeaf,
     },
   ]);
@@ -239,14 +238,14 @@ test('ASP should be able to claim the sent vUtxo using a forfeit transaction', a
     vUtxoPublicKey: alice.publicKey,
   };
 
-  const { vUtxos, unsignedPoolPset } = await createPoolTransaction(
+  const { vUtxo, leaves, unsignedPoolPset } = await createPoolTransaction(
     serviceProviderWallet,
     [aliceOnboard],
     [],
     networks.regtest
   );
 
-  const vUtxoAlice = vUtxos.get(alice.publicKey.toString('hex'));
+  const vUtxoAlice = leaves.get(alice.publicKey.toString('hex'));
   t.not(vUtxoAlice, undefined, 'createPoolTransaction should return vUtxos');
 
   const signedPoolPsetByAlice = aliceWallet.sign(
@@ -264,7 +263,7 @@ test('ASP should be able to claim the sent vUtxo using a forfeit transaction', a
 
   const aliceTransferOrder: TransferOrder = {
     toPublicKey: bob.publicKey,
-    vUtxo: vUtxoAlice.vUtxo,
+    vUtxo,
   };
 
   const nextPoolTx = await createPoolTransaction(
@@ -278,8 +277,8 @@ test('ASP should be able to claim the sent vUtxo using a forfeit transaction', a
     promisedPoolTxID: Pset.fromBase64(nextPoolTx.unsignedPoolPset)
       .unsignedTx()
       .getId(),
-    vUtxoIndex: vUtxoAlice.vUtxo.txIndex,
-    vUtxoTxID: vUtxoAlice.vUtxo.txid,
+    vUtxoIndex: vUtxo.txIndex,
+    vUtxoTxID: vUtxo.txid,
   };
 
   const aliceForfeitMessageHash = hashForfeitMessage(aliceForfeitMessage);
@@ -303,7 +302,7 @@ test('ASP should be able to claim the sent vUtxo using a forfeit transaction', a
 
   // However alice can still broadcast a redeem transaction:
   const aliceRedeem = makeRedeemTransaction(
-    vUtxoAlice.vUtxo,
+    vUtxo,
     vUtxoAlice.vUtxoTree.redeemLeaf
   );
 
@@ -318,10 +317,7 @@ test('ASP should be able to claim the sent vUtxo using a forfeit transaction', a
     },
   ]);
 
-  aliceWallet.addOutpointToSignWithKey(
-    vUtxoAlice.vUtxo.txid,
-    vUtxoAlice.vUtxo.txIndex
-  );
+  aliceWallet.addOutpointToSignWithKey(vUtxo.txid, vUtxo.txIndex);
   const signedRedeem = aliceWallet.sign(updater.pset);
 
   new Finalizer(signedRedeem).finalize();
@@ -347,9 +343,7 @@ test('ASP should be able to claim the sent vUtxo using a forfeit transaction', a
     outputs: [
       new CreatorOutput(
         LBTC,
-        connectorAmount +
-          ElementsValue.fromBytes(vUtxoAlice.vUtxo.witnessUtxo.value).number -
-          500,
+        connectorAmount + 1_0000_0000 - 500,
         serviceProviderWallet.getAddressOutputScript()
       ),
       new CreatorOutput(LBTC, 500),
@@ -370,7 +364,7 @@ test('ASP should be able to claim the sent vUtxo using a forfeit transaction', a
       txIndex: 0,
       witnessUtxo: redeemTransaction.outs[0],
       sighashType: Transaction.SIGHASH_DEFAULT,
-      tapInternalKey: vUtxoAlice.vUtxo.tapInternalKey,
+      tapInternalKey: vUtxo.tapInternalKey,
       tapLeafScript: vUtxoAlice.redeemTree.forfeitLeaf,
     },
   ]);
