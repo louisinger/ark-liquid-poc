@@ -1,7 +1,6 @@
 import {
   AssetHash,
   bip341,
-  script as bscript,
   Creator,
   CreatorOutput,
   crypto,
@@ -13,12 +12,10 @@ import {
   Transaction,
   Updater,
   UpdaterInput,
-  UpdaterOutput,
-  witnessStackToScriptWitness,
 } from 'liquidjs-lib';
 import { BufferWriter } from 'liquidjs-lib/src/bufferutils';
-import { OPS } from 'liquidjs-lib/src/ops';
 import {
+  extractSharedUtxo,
   findLeafIncludingScript,
   sharedCoinTree,
   Stakeholder,
@@ -28,25 +25,32 @@ import * as ecc from 'tiny-secp256k1';
 import { bip68 } from './bip68';
 import {
   ForfeitMessage,
-  OnboardOrder,
+  LiftArgs,
   RedeemTaprootTree,
-  TransferOrder,
   UnsignedPoolTransaction,
+  VirtualTransfer,
   VirtualUtxo,
   VirtualUtxoTaprootTree,
   Wallet,
 } from './core';
-import { makeTimelockedScriptLeaf } from './script';
+import {
+  CheckSequenceVerifyScript,
+  ForfeitScript,
+  FrozenReceiverScript,
+} from './script';
 
 export const H_POINT: Buffer = Buffer.from(
   '0250929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0',
   'hex'
 );
 
-type vUtxoLeaves = {
+export const X_H_POINT = H_POINT.subarray(1);
+
+export const DUST = 400;
+
+type vUtxoRedeem = {
   redeemTree: RedeemTaprootTree;
   redeemLeaf: bip341.TaprootLeaf;
-  claimLeaf: bip341.TaprootLeaf;
 };
 
 const CLAIM_TIMEOUT = bip68(60 * 60 * 24 * 30); // 30 days
@@ -55,97 +59,70 @@ const REDEEM_TIMEOUT = bip68(60 * 60 * 24 * 15); // 15 days
 // ASP_FEE should be much lower! this value is just to avoid dust outputs
 const CHAIN_FEE = 500;
 
-/**
- * Creates an unsigned pool transaction including onboard orders + send orders
- * @param wallet ASP wallet
- * @param onboards set of onboards to include in the pset
- * @param transfers set of transfers to include in the pset
- */
-export async function createPoolTransaction(
-  wallet: Wallet,
-  onboards: OnboardOrder[],
-  transfers: TransferOrder[],
+export function createLiftTransaction(
+  aspPublicKey: Buffer,
+  orders: LiftArgs[],
   network: networks.Network,
+  minerFee = CHAIN_FEE,
   aspClaimTimeout = CLAIM_TIMEOUT,
   redeemTimeout = REDEEM_TIMEOUT
-): Promise<UnsignedPoolTransaction> {
+): Omit<UnsignedPoolTransaction, 'connectors'> {
   const inputs: UpdaterInput[] = [];
   const stakeHolders: Stakeholder[] = [];
   const outputs: CreatorOutput[] = [];
+  const vUtxoTask: vUtxoRedeem[] = [];
 
-  const vUtxoTask: {
-    vUtxoKey: Buffer;
-    vUtxoLeaves: vUtxoLeaves;
-    redeemTree: RedeemTaprootTree;
-  }[] = [];
+  const minerFeeByOrder = Math.ceil(minerFee / orders.length);
 
-  const toOnboard = toOnboardOrder(wallet);
-  // convert transfers to onboard order to receiver
-  // will coin select coin from ASP wallet
-  const fromTransfers = await Promise.all(transfers.map(toOnboard));
-  const onboardOrdersFromTransfer = fromTransfers.map(([o]) => o);
+  const claimLeaf = vUtxoClaimLeaf(aspPublicKey.subarray(1), aspClaimTimeout);
 
-  const connectorsOutputs = fromTransfers
-    .map(([, change]) => change)
-    .filter((c) => c);
-
-  for (const order of [...onboards, ...onboardOrdersFromTransfer]) {
-    const vUtxoLeaves = vUtxoTaprootLeaves(
-      wallet.getPublicKey(),
-      order.vUtxoPublicKey,
-      aspClaimTimeout,
+  for (const order of orders) {
+    const vUtxoRedeem = vUtxoRedeemPath(
+      aspPublicKey.subarray(1),
+      order.vUtxoPublicKey.subarray(1),
       redeemTimeout
     );
 
+    const inputsAmount = sumInputValues(order.coins);
+    const liftedAmount = order.change
+      ? inputsAmount - order.change.amount
+      : inputsAmount;
+    if (liftedAmount <= minerFeeByOrder)
+      throw new Error('order amount is too low');
+
     stakeHolders.push({
-      amount: sumInputValues(order.coins),
-      leaves: [vUtxoLeaves.claimLeaf, vUtxoLeaves.redeemLeaf],
+      amount: liftedAmount - minerFeeByOrder,
+      leaves: [vUtxoRedeem.redeemLeaf],
     });
+
+    if (order.change) {
+      outputs.push(order.change);
+    }
 
     inputs.push(...order.coins);
-
-    vUtxoTask.push({
-      redeemTree: vUtxoLeaves.redeemTree,
-      vUtxoKey: order.vUtxoPublicKey,
-      vUtxoLeaves,
-    });
+    vUtxoTask.push(vUtxoRedeem);
   }
 
   // create the shared output with all stakeholders
-  const taprootTree = sharedCoinTree(stakeHolders);
+  const taprootTree = sharedCoinTree(stakeHolders, [claimLeaf]);
   const sharedOutputScript = bip341
     .BIP341Factory(ecc)
     .taprootOutputScript(H_POINT, taprootTree);
 
   const totalAmount = stakeHolders.reduce((acc, s) => acc + s.amount, 0);
 
-  outputs.push(
+  outputs.unshift(
     new CreatorOutput(network.assetHash, totalAmount, sharedOutputScript)
   );
 
   // add the miner fee
-  outputs.push(new CreatorOutput(network.assetHash, CHAIN_FEE));
+  outputs.push(
+    new CreatorOutput(network.assetHash, minerFeeByOrder * orders.length)
+  );
 
   const pset = Creator.newPset({ outputs });
-
-  // coin select from wallet to pay chain fee
-  const feesCoinSelection = await wallet.coinSelect(
-    CHAIN_FEE,
-    network.assetHash
-  );
-
   const updater = new Updater(pset);
-  updater.addInputs([...inputs, ...feesCoinSelection.coins]);
-  const nbOuts = updater.pset.outputs.length;
-  const changeOutputs = feesCoinSelection.change
-    ? connectorsOutputs.concat(feesCoinSelection.change)
-    : connectorsOutputs;
-  updater.addOutputs(changeOutputs);
-
-  const connectorsIndexes = Array.from(
-    { length: changeOutputs.length },
-    (_, i) => nbOuts + i
-  );
+  updater.addInputs(inputs);
 
   const unsignedTransaction = updater.pset.unsignedTx();
   const txID = unsignedTransaction.getId();
@@ -162,8 +139,145 @@ export async function createPoolTransaction(
   };
 
   for (const task of vUtxoTask) {
-    leaves.set(task.vUtxoKey.toString('hex'), {
-      vUtxoTree: vUtxoTree(taprootTree, task.vUtxoLeaves),
+    const vUtxoOwner = CheckSequenceVerifyScript.decompile(
+      task.redeemTree.claimLeaf.script
+    ).ownerPublicKey;
+
+    leaves.set(vUtxoOwner.toString('hex'), {
+      vUtxoTree: vUtxoTree(taprootTree, task.redeemLeaf, claimLeaf),
+      redeemTree: task.redeemTree,
+    });
+  }
+
+  return {
+    unsignedPoolPset: updater.pset.toBase64(),
+    leaves,
+    vUtxo,
+  };
+}
+
+/**
+ * Creates an unsigned pool transaction including onboard orders + send orders
+ * @param wallet ASP wallet
+ * @param onboards set of onboards to include in the pset
+ * @param transfers set of transfers to include in the pset
+ */
+export async function createPoolTransaction(
+  wallet: Wallet,
+  transfers: VirtualTransfer[],
+  network: networks.Network,
+  aspClaimTimeout = CLAIM_TIMEOUT,
+  redeemTimeout = REDEEM_TIMEOUT,
+  minerFee = CHAIN_FEE
+): Promise<UnsignedPoolTransaction> {
+  const stakeHolders: Stakeholder[] = [];
+
+  const vUtxos: vUtxoRedeem[] = [];
+
+  const claimLeaf = vUtxoClaimLeaf(
+    wallet.getPublicKey().subarray(1),
+    aspClaimTimeout
+  );
+
+  for (const transfer of transfers) {
+    const vUtxoLeaves = vUtxoRedeemPath(
+      wallet.getPublicKey().subarray(1),
+      transfer.toPublicKey.subarray(1),
+      redeemTimeout
+    );
+
+    const coinValue = vUtxoAmount(transfer);
+    if (transfer.amount && coinValue < transfer.amount)
+      throw new Error(
+        `vUtxo amount ${coinValue} too low to cover the send amount ${transfer.amount}`
+      );
+
+    stakeHolders.push({
+      amount: transfer.amount ? transfer.amount : coinValue,
+      leaves: [vUtxoLeaves.redeemLeaf],
+    });
+    vUtxos.push(vUtxoLeaves);
+
+    // create the change vUTXO
+    if (transfer.amount && coinValue - transfer.amount > 0) {
+      const ownerPubKey = FrozenReceiverScript.decompile(
+        transfer.redeemLeaf.script
+      ).ownerPublicKey;
+
+      const vUtxoLeaves = vUtxoRedeemPath(
+        wallet.getPublicKey().subarray(1),
+        ownerPubKey,
+        redeemTimeout
+      );
+
+      stakeHolders.push({
+        amount: coinValue - transfer.amount,
+        leaves: [vUtxoLeaves.redeemLeaf],
+      });
+      vUtxos.push(vUtxoLeaves);
+    }
+  }
+
+  // create the shared output with all stakeholders
+  const taprootTree = sharedCoinTree(stakeHolders, [claimLeaf]);
+  const sharedOutputScript = bip341
+    .BIP341Factory(ecc)
+    .taprootOutputScript(H_POINT, taprootTree);
+
+  const totalAmount = stakeHolders.reduce((acc, s) => acc + s.amount, 0);
+
+  const connector = new CreatorOutput(
+    network.assetHash,
+    DUST,
+    wallet.getChangeScriptPubKey()
+  );
+  const connectorsOutputs = new Array(transfers.length).fill(connector);
+  const connAmount = DUST * connectorsOutputs.length;
+
+  // coin select liquidity
+  const { coins, change } = await wallet.coinSelect(
+    totalAmount + minerFee + connAmount,
+    network.assetHash
+  );
+
+  const pset = Creator.newPset({
+    outputs: [
+      new CreatorOutput(network.assetHash, totalAmount, sharedOutputScript),
+      new CreatorOutput(network.assetHash, minerFee),
+      ...connectorsOutputs,
+    ],
+  });
+
+  const connectorsIndexes = Array.from(
+    { length: connectorsOutputs.length },
+    (_, i) => i + 2
+  );
+
+  const updater = new Updater(pset);
+  updater.addInputs(coins);
+  if (change) updater.addOutputs([change]);
+
+  const unsignedTransaction = updater.pset.unsignedTx();
+  const txID = unsignedTransaction.getId();
+
+  // craft the redeem txs
+  const leaves: UnsignedPoolTransaction['leaves'] = new Map();
+
+  const vUtxo = {
+    txid: txID,
+    txIndex: 0,
+    tapInternalKey: H_POINT.subarray(1),
+    witnessUtxo: unsignedTransaction.outs[0],
+    sighashType: Transaction.SIGHASH_DEFAULT,
+  };
+
+  for (const task of vUtxos) {
+    const vUtxoOwner = CheckSequenceVerifyScript.decompile(
+      task.redeemTree.claimLeaf.script
+    ).ownerPublicKey;
+
+    leaves.set(vUtxoOwner.toString('hex'), {
+      vUtxoTree: vUtxoTree(taprootTree, task.redeemLeaf, claimLeaf),
       redeemTree: task.redeemTree,
     });
   }
@@ -185,28 +299,39 @@ export async function createPoolTransaction(
 export function makeRedeemTransaction(
   vUtxo: VirtualUtxo,
   toRedeemLeaf: VirtualUtxoTaprootTree['redeemLeaf']
-): Pset {
-  const toRedeemScript = bscript.decompile(toRedeemLeaf.script);
-  const redeemTaprootKey = toRedeemScript[toRedeemScript.length - 2];
-  if (!Buffer.isBuffer(redeemTaprootKey) || redeemTaprootKey.length !== 32) {
-    throw new Error(
-      'witnessProgram is invalid in toRedeemLeaf: ' + redeemTaprootKey
-    );
-  }
+): [Pset, FinalizeFunc] {
+  const toRedeemScript = FrozenReceiverScript.decompile(toRedeemLeaf.script);
 
   const redeemScriptPubKey = Buffer.concat([
     Buffer.from([0x51, 0x20]),
-    redeemTaprootKey,
+    toRedeemScript.witnessProgram,
   ]);
 
-  const pset = Creator.newPset({
-    outputs: [
+  const sharedUtxo = extractSharedUtxo(toRedeemLeaf.script);
+
+  const outputs = [
+    new CreatorOutput(
+      AssetHash.fromBytes(vUtxo.witnessUtxo.asset).hex,
+      ElementsValue.fromBytes(vUtxo.witnessUtxo.value).number,
+      redeemScriptPubKey
+    ),
+  ];
+
+  if (sharedUtxo) {
+    outputs.unshift(
       new CreatorOutput(
         AssetHash.fromBytes(vUtxo.witnessUtxo.asset).hex,
-        ElementsValue.fromBytes(vUtxo.witnessUtxo.value).number,
-        redeemScriptPubKey
-      ),
-    ],
+        sharedUtxo.amount,
+        Buffer.concat([
+          Buffer.from([0x51, 0x20]),
+          sharedUtxo.taprootWitnessProgram,
+        ])
+      )
+    );
+  }
+
+  const pset = Creator.newPset({
+    outputs,
   });
 
   const updater = new Updater(pset);
@@ -217,7 +342,7 @@ export function makeRedeemTransaction(
     },
   ]);
 
-  return updater.pset;
+  return [updater.pset, FrozenReceiverScript.finalizer(sharedUtxo ? 1 : 0)];
 }
 
 // In order to lost rights on vUtxo redeem, user has to sign the hash of a ForfeitMessage
@@ -229,53 +354,17 @@ export function hashForfeitMessage(msg: ForfeitMessage) {
   return crypto.sha256(writer.buffer);
 }
 
-export function forfeitFinalizer(
-  aspSig: Buffer,
-  userSig: Buffer,
-  msg: ForfeitMessage
-): FinalizeFunc {
-  return function (inIndex: number, pset: Pset) {
-    const tapLeaf = pset.inputs[inIndex].tapLeafScript?.at(0);
-    if (!tapLeaf) {
-      throw new Error('input must have tapLeafScript');
-    }
+function vUtxoAmount({
+  vUtxo,
+  redeemLeaf,
+}: Omit<VirtualTransfer, 'toPublicKey'>): number {
+  let amount = ElementsValue.fromBytes(vUtxo.witnessUtxo.value).number;
+  const changeData = extractSharedUtxo(redeemLeaf.script);
+  if (changeData) {
+    amount -= changeData.amount;
+  }
 
-    const outpoint = BufferWriter.withCapacity(32 + 4);
-    outpoint.writeSlice(Buffer.from(msg.vUtxoTxID, 'hex').reverse());
-    outpoint.writeUInt32(msg.vUtxoIndex);
-
-    const args = [
-      // [aspSignature, signature, outpoint, promisedTxId]
-      aspSig,
-      userSig,
-      outpoint.buffer,
-      Buffer.from(msg.promisedPoolTxID, 'hex').reverse(),
-    ];
-
-    return {
-      finalScriptWitness: witnessStackToScriptWitness(
-        args.concat(tapLeaf.script).concat(tapLeaf.controlBlock)
-      ),
-    };
-  };
-}
-
-function toOnboardOrder(
-  wallet: Wallet
-): (sendOrder: TransferOrder) => Promise<[OnboardOrder, UpdaterOutput?]> {
-  return async (sendOrder) => {
-    const { coins, change } = await wallet.coinSelect(
-      ElementsValue.fromBytes(sendOrder.vUtxo.witnessUtxo.value).number,
-      AssetHash.fromBytes(sendOrder.vUtxo.witnessUtxo.asset).hex
-    );
-
-    const onboardOrder = {
-      coins,
-      vUtxoPublicKey: sendOrder.toPublicKey,
-    };
-
-    return [onboardOrder, change];
-  };
+  return amount;
 }
 
 function toTapLeafScript(
@@ -301,36 +390,81 @@ function toTapLeafScript(
 
 function vUtxoTree(
   vUtxoTree: bip341.HashTree,
-  leaves: vUtxoLeaves
+  redeemLeaf: bip341.TaprootLeaf,
+  claimLeaf: bip341.TaprootLeaf
 ): VirtualUtxoTaprootTree {
   return {
-    claimLeaf: toTapLeafScript(leaves.claimLeaf, vUtxoTree),
-    redeemLeaf: toTapLeafScript(leaves.redeemLeaf, vUtxoTree),
+    claimLeaf: toTapLeafScript(claimLeaf, vUtxoTree),
+    redeemLeaf: toTapLeafScript(redeemLeaf, vUtxoTree),
   };
 }
 
-function vUtxoTaprootLeaves(
+function vUtxoClaimLeaf(
+  serviceProviderPublicKey: Buffer,
+  claimTimeout: Buffer
+): bip341.TaprootLeaf {
+  if (serviceProviderPublicKey.length !== 32) {
+    throw new Error('serviceProviderPublicKey must be 32 bytes');
+  }
+
+  const scriptHex = new CheckSequenceVerifyScript(
+    serviceProviderPublicKey,
+    claimTimeout
+  )
+    .compile()
+    .toString('hex');
+
+  return {
+    scriptHex,
+  };
+}
+
+function vUtxoRedeemPath(
   serviceProviderPublicKey: Buffer,
   vUtxoPublicKey: Buffer,
-  aspClaimTimeout: Buffer,
   redeemTimeout: Buffer
-): vUtxoLeaves {
-  if (serviceProviderPublicKey.length !== 33) {
-    throw new Error('serviceProviderPublicKey must be 33 bytes');
+): vUtxoRedeem {
+  if (serviceProviderPublicKey.length !== 32) {
+    throw new Error('serviceProviderPublicKey must be 32 bytes');
   }
-  if (vUtxoPublicKey.length !== 33) {
-    throw new Error('vUtxoPublicKey must be 33 bytes');
+  if (vUtxoPublicKey.length !== 32) {
+    throw new Error('vUtxoPublicKey must be 32 bytes');
   }
 
-  // after CLAIM_TIMEOUT, the ASP should be able to claim the utxo
-  const claimLeaf = makeTimelockedScriptLeaf(
-    serviceProviderPublicKey.subarray(1),
-    aspClaimTimeout
+  const { outputScript, redeemTree } = redeemPath(
+    serviceProviderPublicKey,
+    vUtxoPublicKey,
+    redeemTimeout
   );
 
-  const refundKey = Buffer.from(
-    ecc.pointAdd(serviceProviderPublicKey, vUtxoPublicKey)
-  );
+  // must send all to the redeem output script
+  const toRedeem = new FrozenReceiverScript(
+    vUtxoPublicKey,
+    outputScript.subarray(2)
+  )
+    .compile()
+    .toString('hex');
+
+  const redeemLeaf = { scriptHex: toRedeem };
+
+  return {
+    redeemLeaf,
+    redeemTree,
+  };
+}
+
+export function redeemPath(
+  serviceProviderPublicKey: Buffer,
+  vUtxoPublicKey: Buffer,
+  redeemTimeout: Buffer = REDEEM_TIMEOUT
+) {
+  if (serviceProviderPublicKey.length !== 32) {
+    throw new Error('serviceProviderPublicKey must be 32 bytes');
+  }
+
+  if (vUtxoPublicKey.length !== 32) {
+    throw new Error('vUtxoPublicKey must be 32 bytes');
+  }
 
   const redeemTree = redeemTxTapTree(
     serviceProviderPublicKey,
@@ -339,53 +473,8 @@ function vUtxoTaprootLeaves(
   );
   const outputScript = bip341
     .BIP341Factory(ecc)
-    .taprootOutputScript(refundKey, redeemTree.tree);
-
-  const witnessProgram = outputScript.subarray(2);
-
-  // must send all to the redeem output script
-  const toRedeem = bscript
-    .compile([
-      // [vUtxoOwnerSig]
-      vUtxoPublicKey.subarray(1),
-      OPS.OP_CHECKSIGVERIFY,
-
-      OPS.OP_PUSHCURRENTINPUTINDEX,
-      OPS.OP_INSPECTINPUTASSET,
-      OPS.OP_CAT,
-      // [asset+assetPrefix]
-      OPS.OP_0,
-      OPS.OP_INSPECTOUTPUTASSET,
-      // [asset+assetPrefix, asset, assetPrefix]
-      OPS.OP_CAT,
-      // [asset+assetPrefix, asset+assetPrefix]
-      OPS.OP_EQUALVERIFY,
-
-      OPS.OP_PUSHCURRENTINPUTINDEX,
-      OPS.OP_INSPECTINPUTVALUE,
-      OPS.OP_CAT,
-      // [value+valuePrefix]
-      OPS.OP_0,
-      OPS.OP_INSPECTOUTPUTVALUE,
-      OPS.OP_CAT,
-      OPS.OP_EQUALVERIFY,
-
-      OPS.OP_0,
-      OPS.OP_INSPECTOUTPUTSCRIPTPUBKEY,
-      OPS.OP_1, // should be segwit v1
-      OPS.OP_EQUALVERIFY,
-      witnessProgram,
-      OPS.OP_EQUAL,
-    ])
-    .toString('hex');
-
-  const redeemLeaf = { scriptHex: toRedeem };
-
-  return {
-    claimLeaf,
-    redeemLeaf,
-    redeemTree,
-  };
+    .taprootOutputScript(H_POINT, redeemTree.tree);
+  return { outputScript, redeemTree };
 }
 
 function redeemTxTapTree(
@@ -393,74 +482,34 @@ function redeemTxTapTree(
   vUtxoPublicKey: Buffer,
   redeemTimeout: Buffer
 ): RedeemTaprootTree {
-  const forfeit = bscript
-    .compile([
-      // [aspSignature, signature, outpoint, promisedTxId]
-      OPS.OP_DUP,
-      // [aspSignature, signature, outpoint, promisedTxId, promisedTxId]
-      OPS.OP_2,
-      OPS.OP_ROLL,
-      // [aspSignature, signature, promisedTxId, promisedTxId, outpoint]
-      OPS.OP_SWAP,
-      OPS.OP_CAT,
-      // [aspSignature, signature, promisedTxId, outpoint+promisedTxId]
-      OPS.OP_SHA256,
-      // [aspSignature, signature, promisedTxId, hash]
-      OPS.OP_DUP,
-      // [aspSignature, signature, promisedTxId, hash, hash]
-      OPS.OP_3,
-      OPS.OP_ROLL,
-      // [aspSignature, promisedTxId, hash, hash, signature]
-      OPS.OP_SWAP,
-      // [aspSignature, promisedTxId, hash, signature, hash]
-      vUtxoPublicKey.subarray(1),
-      OPS.OP_CHECKSIGFROMSTACKVERIFY,
-      // [aspSignature, promisedTxId, hash]
-      OPS.OP_2,
-      OPS.OP_ROLL,
-      // [promisedTx, hash, aspSignature]
-      OPS.OP_SWAP,
-      // [promisedTx, aspSignature, hash]
-      serviceProviderPubKey.subarray(1),
-      OPS.OP_CHECKSIGFROMSTACKVERIFY,
-
-      // [promisedTxId]
-      OPS.OP_0,
-      OPS.OP_INSPECTINPUTOUTPOINT,
-      OPS.OP_DROP, // drop the input flag
-      OPS.OP_DROP, // drop the input vout
-      OPS.OP_EQUAL, // check that input 0 is the promised tx ID
-    ])
+  const forfeit = new ForfeitScript(vUtxoPublicKey, serviceProviderPubKey)
+    .compile()
     .toString('hex');
 
-  const claim = makeTimelockedScriptLeaf(
-    vUtxoPublicKey.subarray(1),
-    redeemTimeout
-  );
+  const claim = new CheckSequenceVerifyScript(vUtxoPublicKey, redeemTimeout)
+    .compile()
+    .toString('hex');
 
+  const claimLeaf = { scriptHex: claim };
   const forfeitLeaf = { scriptHex: forfeit };
 
-  const leaves = [forfeitLeaf, claim];
+  const leaves = [forfeitLeaf, claimLeaf];
 
   const tree = bip341.toHashTree(leaves, true);
 
   const forfeitLeafHash = bip341.tapLeafHash(forfeitLeaf);
-  const claimLeafHash = bip341.tapLeafHash(claim);
+  const claimLeafHash = bip341.tapLeafHash(claimLeaf);
 
   const forfeitPath = bip341.findScriptPath(tree, forfeitLeafHash);
   const claimPath = bip341.findScriptPath(tree, claimLeafHash);
 
-  const refundKey = Buffer.from(
-    ecc.pointAdd(serviceProviderPubKey, vUtxoPublicKey)
-  );
-
   const [forfeitScript, forfeitControlBlock] = bip341
     .BIP341Factory(ecc)
-    .taprootSignScriptStack(refundKey, forfeitLeaf, tree.hash, forfeitPath);
+    .taprootSignScriptStack(H_POINT, forfeitLeaf, tree.hash, forfeitPath);
 
   const [claimScript, claimControlBlock] = bip341
     .BIP341Factory(ecc)
-    .taprootSignScriptStack(refundKey, claim, tree.hash, claimPath);
+    .taprootSignScriptStack(H_POINT, claimLeaf, tree.hash, claimPath);
 
   return {
     tree,

@@ -1,5 +1,6 @@
 import {
   bip341,
+  CreatorOutput,
   Pset,
   TapInternalKey,
   TapLeafScript,
@@ -23,16 +24,25 @@ export type VirtualUtxo = UpdaterInput & {
   witnessUtxo: UpdaterInput['witnessUtxo'];
 };
 
+export type ExtendedVirtualUtxo = {
+  vUtxo: VirtualUtxo;
+  redeemTree: RedeemTaprootTree;
+  vUtxoTree: VirtualUtxoTaprootTree;
+};
+
 // onchain --> vUtxo
-export type OnboardOrder = {
+export type LiftArgs = {
+  change?: CreatorOutput;
   coins: UpdaterInput[];
   vUtxoPublicKey: Buffer;
 };
 
 // vUtxo --> vUtxo
-export type TransferOrder = {
+export type VirtualTransfer = {
   vUtxo: VirtualUtxo;
+  redeemLeaf: TapLeafScript;
   toPublicKey: Buffer;
+  amount?: number;
 };
 
 export type ForfeitMessage = {
@@ -43,22 +53,18 @@ export type ForfeitMessage = {
 
 export interface Wallet {
   getPublicKey(): Buffer;
+  getChangeScriptPubKey(): Buffer;
   coinSelect(
     amount: number,
     asset: string
   ): Promise<{ coins: UpdaterInput[]; change?: UpdaterOutput }>;
   sign(pset: Pset): Pset;
+  signSchnorr(msg: Buffer): Buffer;
 }
 
 export type UnsignedPoolTransaction = {
   unsignedPoolPset: string; // the pool pset without the signatures
   vUtxo: VirtualUtxo;
-  leaves: Map<
-    string,
-    {
-      vUtxoTree: VirtualUtxoTaprootTree;
-      redeemTree: RedeemTaprootTree;
-    }
-  >;
+  leaves: Map<string, Pick<ExtendedVirtualUtxo, 'vUtxoTree' | 'redeemTree'>>;
   connectors: Array<number>;
 };

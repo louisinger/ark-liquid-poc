@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-unused-vars */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import axios from 'axios';
 import { ECPairInterface } from 'ecpair';
@@ -5,7 +6,6 @@ import {
   BIP174SigningData,
   bip341,
   BIP371SigningData,
-  ElementsValue,
   networks,
   payments,
   Pset,
@@ -17,7 +17,9 @@ import {
 } from 'liquidjs-lib';
 import * as ecc from 'tiny-secp256k1';
 
-import { Wallet } from './core';
+import { ForfeitMessage, Wallet } from './core';
+import { PoolManagerRepository } from './poolManager';
+import { PoolWatcherRepository } from './poolWatcher';
 
 const APIURL = process.env.APIURL || 'http://localhost:3001';
 export const TESTNET_APIURL = 'https://blockstream.info/liquidtestnet/api';
@@ -179,6 +181,16 @@ export class TestWallet implements Wallet {
       network: networks.regtest,
     });
   }
+  signSchnorr(msg: Buffer): Buffer {
+    // ASP signs the forfeit message
+    return Buffer.from(
+      ecc.signSchnorr(msg, this.keys.privateKey, Buffer.alloc(32))
+    );
+  }
+
+  getChangeScriptPubKey(): Buffer {
+    return this.p2wpkh.output;
+  }
 
   getPublicKey(): Buffer {
     return this.keys.publicKey;
@@ -188,25 +200,31 @@ export class TestWallet implements Wallet {
     amount: number,
     asset: string
   ): Promise<{ coins: UpdaterInput[]; change?: UpdaterOutput }> {
-    const { txid, vout } = await faucet(this.p2wpkh.address);
-    this.outpoints.push({ txid, vout });
-    const txHex = await fetchTx(txid);
-    const transaction = Transaction.fromHex(txHex);
-    const witnessUtxo = transaction.outs[vout];
+    const numberOfFaucets = Math.ceil(amount / 1_0000_0000);
+    const coins = [];
 
-    const utxo: UpdaterInput = {
-      txid,
-      txIndex: vout,
-      witnessUtxo,
-      sighashType: Transaction.SIGHASH_ALL,
-    };
+    for (const _ of Array(numberOfFaucets).keys()) {
+      const { txid, vout } = await faucet(this.p2wpkh.address);
+      this.outpoints.push({ txid, vout });
+      const txHex = await fetchTx(txid);
+      const transaction = Transaction.fromHex(txHex);
+      const witnessUtxo = transaction.outs[vout];
 
-    const utxoAmount = ElementsValue.fromBytes(witnessUtxo.value).number;
-    const changeAmount = utxoAmount - amount;
+      const utxo: UpdaterInput = {
+        txid,
+        txIndex: vout,
+        witnessUtxo,
+        sighashType: Transaction.SIGHASH_ALL,
+      };
+      coins.push(utxo);
+    }
 
-    if (changeAmount <= 0) {
+    const changeAmount = numberOfFaucets * 1_0000_0000 - amount;
+    if (changeAmount < 0) throw new Error('Not enough funds');
+
+    if (changeAmount === 0) {
       return {
-        coins: [utxo],
+        coins,
       };
     }
 
@@ -217,7 +235,7 @@ export class TestWallet implements Wallet {
     };
 
     return {
-      coins: [utxo],
+      coins,
       change: changeOutput,
     };
   }
@@ -228,6 +246,7 @@ export class TestWallet implements Wallet {
       const inputID = Buffer.from(input.previousTxid).reverse().toString('hex');
 
       if (
+        input.witnessUtxo?.script.equals(this.p2wpkh.output) ||
         this.outpoints.find(
           (o) => o.txid === inputID && o.vout === input.previousTxIndex
         )
@@ -250,5 +269,81 @@ export class TestWallet implements Wallet {
 
   addOutpointToSignWithKey(txid: string, vout: number): void {
     this.outpoints.push({ txid, vout });
+  }
+}
+
+export type Repository = PoolWatcherRepository & PoolManagerRepository;
+
+export class TestRepository implements Repository {
+  private forfeitByScriptPubKey: Map<
+    string,
+    { msg: ForfeitMessage; sig: string }
+  > = new Map();
+  private poolTransactions: Map<
+    string,
+    {
+      hex: string;
+      connectors: number[];
+      poolOutpoint: { txID: string; vout: number; hex: string };
+    }
+  > = new Map();
+
+  getForfeit(
+    scriptPubKey: string
+  ): Promise<{ msg: ForfeitMessage; sig: string }> {
+    return Promise.resolve(this.forfeitByScriptPubKey.get(scriptPubKey));
+  }
+
+  getAllPoolTransactionsIDs(): Promise<string[]> {
+    return Promise.resolve(Array.from(this.poolTransactions.keys()));
+  }
+
+  getPoolTransaction(txID: string): Promise<{
+    hex: string;
+    connectors: number[];
+    poolOutpoint: { txID: string; vout: number; hex: string };
+  }> {
+    return Promise.resolve(this.poolTransactions.get(txID));
+  }
+
+  updatePoolOutpoint(
+    poolID: string,
+    outpoint: { txID: string; vout: number; hex: string }
+  ): Promise<void> {
+    this.poolTransactions.set(poolID, {
+      ...this.poolTransactions.get(poolID),
+      poolOutpoint: outpoint,
+    });
+    return Promise.resolve();
+  }
+
+  updateConnectors(poolID: string, connectors: number[]): Promise<void> {
+    this.poolTransactions.set(poolID, {
+      ...this.poolTransactions.get(poolID),
+      connectors,
+    });
+    return Promise.resolve();
+  }
+
+  setForfeit(
+    redeemScriptPubKey: string,
+    forfeitMessage: ForfeitMessage,
+    signature: string
+  ): Promise<void> {
+    this.forfeitByScriptPubKey.set(redeemScriptPubKey, {
+      msg: forfeitMessage,
+      sig: signature,
+    });
+    return Promise.resolve();
+  }
+
+  setPoolTransaction(txHex: string, connectors: number[]): Promise<void> {
+    const transaction = Transaction.fromHex(txHex);
+    this.poolTransactions.set(transaction.getId(), {
+      hex: txHex,
+      connectors,
+      poolOutpoint: { txID: transaction.getId(), vout: 0, hex: txHex },
+    });
+    return Promise.resolve();
   }
 }

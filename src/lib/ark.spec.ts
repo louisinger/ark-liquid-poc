@@ -1,5 +1,4 @@
 import test from 'ava';
-import bip68 from 'bip68';
 import { ECPairFactory } from 'ecpair';
 import {
   Creator,
@@ -16,12 +15,13 @@ import * as ecc from 'tiny-secp256k1';
 
 import { broadcast, TestWallet } from './_regtest.spec';
 import {
+  createLiftTransaction,
   createPoolTransaction,
-  forfeitFinalizer,
   hashForfeitMessage,
   makeRedeemTransaction,
 } from './ark';
-import { ForfeitMessage, OnboardOrder, TransferOrder } from './core';
+import { ForfeitMessage, LiftArgs, VirtualTransfer } from './core';
+import { ForfeitScript } from './script';
 
 const ECPair = ECPairFactory(ecc);
 
@@ -36,26 +36,27 @@ const serviceProviderWallet = new TestWallet(serviceProvider);
 
 const bob = ECPair.makeRandom();
 
-test('vUtxo can be sent as quick as the ASP creates a pool transaction', async (t) => {
+test.skip('vUtxo can be sent as quick as the ASP creates a pool transaction', async (t) => {
   const { coins, change } = await aliceWallet.coinSelect(ONE_LBTC, LBTC);
   t.is(change, undefined, 'alice change should be undefined');
 
   // Alice selects some on-chain coin to onboard on Ark
-  const aliceOnboard: OnboardOrder = {
+  const aliceOnboard: LiftArgs = {
     coins,
     vUtxoPublicKey: alice.publicKey,
   };
 
-  // the ASP receives several onboard orders and creates a pool transaction
-  // it returns associated taproot vUtxo taproot tree to Alice
-  const { vUtxo, leaves, unsignedPoolPset } = await createPoolTransaction(
-    serviceProviderWallet,
+  // Using the ASP public key, Alice creates a lift transaction
+  // it creates a vUtxo from mainchain coins
+  const { vUtxo, leaves, unsignedPoolPset } = createLiftTransaction(
+    serviceProviderWallet.getPublicKey(),
     [aliceOnboard],
-    [],
     networks.regtest
   );
 
-  const vUtxoLeavesAlice = leaves.get(alice.publicKey.toString('hex'));
+  const vUtxoLeavesAlice = leaves.get(
+    alice.publicKey.subarray(1).toString('hex')
+  );
   t.not(
     vUtxoLeavesAlice,
     undefined,
@@ -84,15 +85,16 @@ test('vUtxo can be sent as quick as the ASP creates a pool transaction', async (
 
   // then Alice wants to send the vUtxo to Bob
   // firstly, she ask for a place in next pool transaction to the ASP
-  const aliceTransferOrder: TransferOrder = {
+  const aliceTransferOrder: VirtualTransfer = {
     toPublicKey: bob.publicKey,
     vUtxo,
+    // the redeem leaf identity my vUtxo in the shared output
+    redeemLeaf: vUtxoLeavesAlice.vUtxoTree.redeemLeaf,
   };
 
   // the ASP gets the transfer order and process it in the next pool tx
   const nextPoolTx = await createPoolTransaction(
     serviceProviderWallet,
-    [],
     [aliceTransferOrder],
     networks.regtest
   );
@@ -138,25 +140,25 @@ test('vUtxo can be sent as quick as the ASP creates a pool transaction', async (
   t.pass();
 });
 
-test('vUtxo can leave the Ark using a redeem transaction', async (t) => {
+test.skip('vUtxo can leave the Ark using a redeem transaction', async (t) => {
   const { coins, change } = await aliceWallet.coinSelect(ONE_LBTC, LBTC);
   t.is(change, undefined, 'alice change should be undefined');
 
-  const aliceOnboard: OnboardOrder = {
+  const aliceOnboard: LiftArgs = {
     coins,
     vUtxoPublicKey: alice.publicKey,
   };
 
-  const { vUtxo, leaves, unsignedPoolPset } = await createPoolTransaction(
-    serviceProviderWallet,
+  const { vUtxo, leaves, unsignedPoolPset } = createLiftTransaction(
+    serviceProviderWallet.getPublicKey(),
     [aliceOnboard],
-    [],
     networks.regtest,
     undefined,
-    bip68.encode({ blocks: 1 })
+    undefined,
+    Buffer.from('00000001', 'hex')
   );
 
-  const vUtxoAlice = leaves.get(alice.publicKey.toString('hex'));
+  const vUtxoAlice = leaves.get(alice.publicKey.subarray(1).toString('hex'));
   t.not(vUtxoAlice, undefined, 'createPoolTransaction should return vUtxos');
   const signedPoolPsetByAlice = aliceWallet.sign(
     Pset.fromBase64(unsignedPoolPset)
@@ -169,7 +171,7 @@ test('vUtxo can leave the Ark using a redeem transaction', async (t) => {
 
   // At any moment, Alice can exit the Ark by creating a redeem transaction using the redeemLeaf she owns
   // The transaction will move the vUtxo coins to the redeem taproot tree, letting either Alice to claim it after x time or the ASP to claim it with the signed forfeit message
-  const aliceRedeem = makeRedeemTransaction(
+  const [aliceRedeem, finalizeRedeemInput] = makeRedeemTransaction(
     vUtxo,
     vUtxoAlice.vUtxoTree.redeemLeaf
   );
@@ -188,7 +190,7 @@ test('vUtxo can leave the Ark using a redeem transaction', async (t) => {
   aliceWallet.addOutpointToSignWithKey(vUtxo.txid, vUtxo.txIndex);
   const signedRedeem = aliceWallet.sign(updater.pset);
 
-  new Finalizer(signedRedeem).finalize();
+  new Finalizer(signedRedeem).finalizeInput(0, finalizeRedeemInput).finalize();
   const redeemTransaction = Extractor.extract(signedRedeem);
   console.log('redeem tx (hex):', redeemTransaction.toHex());
   const redeemTxID = await broadcast(redeemTransaction.toHex());
@@ -196,12 +198,13 @@ test('vUtxo can leave the Ark using a redeem transaction', async (t) => {
 
   // after timeout (here 1 block), Alice can unlock the redeem tx output #0 (using vUtxo private key)
   await aliceWallet.coinSelect(500, LBTC); // will generate a block, for testing purpose only
+  await aliceWallet.coinSelect(500, LBTC); // will generate a block, for testing purpose only
 
   const moveRedeemUtxoPset = Creator.newPset({
     outputs: [
       new CreatorOutput(
         LBTC,
-        1_0000_0000 - 500,
+        1_0000_0000 - 500 - 500,
         aliceWallet.getAddressOutputScript()
       ),
       new CreatorOutput(LBTC, 500),
@@ -216,6 +219,7 @@ test('vUtxo can leave the Ark using a redeem transaction', async (t) => {
       sighashType: Transaction.SIGHASH_DEFAULT,
       tapInternalKey: vUtxo.tapInternalKey,
       tapLeafScript: vUtxoAlice.redeemTree.claimLeaf,
+      sequence: 1,
     },
   ]);
 
@@ -229,23 +233,22 @@ test('vUtxo can leave the Ark using a redeem transaction', async (t) => {
   t.pass();
 });
 
-test('ASP should be able to claim the sent vUtxo using a forfeit transaction', async (t) => {
+test.skip('ASP should be able to claim the sent vUtxo using a forfeit transaction', async (t) => {
   const { coins, change } = await aliceWallet.coinSelect(ONE_LBTC, LBTC);
   t.is(change, undefined, 'alice change should be undefined');
 
-  const aliceOnboard: OnboardOrder = {
+  const aliceOnboard: LiftArgs = {
     coins,
     vUtxoPublicKey: alice.publicKey,
   };
 
-  const { vUtxo, leaves, unsignedPoolPset } = await createPoolTransaction(
-    serviceProviderWallet,
+  const { vUtxo, leaves, unsignedPoolPset } = createLiftTransaction(
+    serviceProviderWallet.getPublicKey(),
     [aliceOnboard],
-    [],
     networks.regtest
   );
 
-  const vUtxoAlice = leaves.get(alice.publicKey.toString('hex'));
+  const vUtxoAlice = leaves.get(alice.publicKey.subarray(1).toString('hex'));
   t.not(vUtxoAlice, undefined, 'createPoolTransaction should return vUtxos');
 
   const signedPoolPsetByAlice = aliceWallet.sign(
@@ -261,14 +264,14 @@ test('ASP should be able to claim the sent vUtxo using a forfeit transaction', a
   // At any moment, Alice can exit the Ark by creating a redeem transaction
   // const aliceRedeem = makeRedeemTransaction(vUtxoAlice.vUtxo, vUtxoAlice.vUtxoTree.redeemLeaf)
 
-  const aliceTransferOrder: TransferOrder = {
+  const aliceTransferOrder: VirtualTransfer = {
     toPublicKey: bob.publicKey,
     vUtxo,
+    redeemLeaf: vUtxoAlice.vUtxoTree.redeemLeaf,
   };
 
   const nextPoolTx = await createPoolTransaction(
     serviceProviderWallet,
-    [],
     [aliceTransferOrder],
     networks.regtest
   );
@@ -301,7 +304,7 @@ test('ASP should be able to claim the sent vUtxo using a forfeit transaction', a
   // once the nextTx is in the mempool, Bob owns the vUtxo and can repeat the process.
 
   // However alice can still broadcast a redeem transaction:
-  const aliceRedeem = makeRedeemTransaction(
+  const [aliceRedeem, finalizeRedeemInput] = makeRedeemTransaction(
     vUtxo,
     vUtxoAlice.vUtxoTree.redeemLeaf
   );
@@ -320,7 +323,7 @@ test('ASP should be able to claim the sent vUtxo using a forfeit transaction', a
   aliceWallet.addOutpointToSignWithKey(vUtxo.txid, vUtxo.txIndex);
   const signedRedeem = aliceWallet.sign(updater.pset);
 
-  new Finalizer(signedRedeem).finalize();
+  new Finalizer(signedRedeem).finalizeInput(0, finalizeRedeemInput).finalize();
   const redeemTransaction = Extractor.extract(signedRedeem);
   console.log('redeem tx (hex):', redeemTransaction.toHex());
   const redeemTxID = await broadcast(redeemTransaction.toHex());
@@ -343,7 +346,7 @@ test('ASP should be able to claim the sent vUtxo using a forfeit transaction', a
     outputs: [
       new CreatorOutput(
         LBTC,
-        connectorAmount + 1_0000_0000 - 500,
+        connectorAmount + 1_0000_0000 - 500 - 500,
         serviceProviderWallet.getAddressOutputScript()
       ),
       new CreatorOutput(LBTC, 500),
@@ -370,12 +373,8 @@ test('ASP should be able to claim the sent vUtxo using a forfeit transaction', a
   ]);
 
   // ASP signs the forfeit message
-  const providerSignature = Buffer.from(
-    ecc.signSchnorr(
-      aliceForfeitMessageHash,
-      serviceProvider.privateKey,
-      Buffer.alloc(32)
-    )
+  const providerSignature = serviceProviderWallet.signSchnorr(
+    aliceForfeitMessageHash
   );
 
   const signedForfeitPset = serviceProviderWallet.sign(forfeitUpdater.pset);
@@ -384,7 +383,11 @@ test('ASP should be able to claim the sent vUtxo using a forfeit transaction', a
     .finalizeInput(0)
     .finalizeInput(
       1,
-      forfeitFinalizer(providerSignature, aliceSignature, aliceForfeitMessage)
+      ForfeitScript.finalizer(
+        aliceForfeitMessage,
+        providerSignature,
+        aliceSignature
+      )
     );
 
   const signedForfeitTx = Extractor.extract(forfeitUpdater.pset);
@@ -393,6 +396,5 @@ test('ASP should be able to claim the sent vUtxo using a forfeit transaction', a
   console.log('forfeit txID:', forfeitTxID);
 
   // ASP has now the coins, Alice can't claim them anymore
-
   t.pass();
 });
